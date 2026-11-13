@@ -10,11 +10,6 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/v2"
 	"github.com/zerodha/dungbeetle/v2/internal/core"
-
-	// Clickhouse, MySQL and Postgres drivers.
-	_ "github.com/ClickHouse/clickhouse-go"
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
 )
 
 // Handlers holds all application dependencies

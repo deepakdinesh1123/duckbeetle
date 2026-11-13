@@ -1,7 +1,11 @@
 [app]
-log_level = "DEBUG"
-default_job_ttl = "60s"
+# log level is one of : INFO, DEBUG, ERROR
+log_level = "INFO"
+# maximum time allowed for a job to run once it has started execution
+default_job_ttl = "72h"
 
+# The broker that manages job queuing.
+# Currently, only "redis" is supported.
 [job_queue.broker]
 type = "redis"
 addresses = ["localhost:6379"]
@@ -13,6 +17,8 @@ dial_timeout = "1s"
 read_timeout = "1s"
 write_timeout = "1s"
 
+# The state store where the state of the jobs in the queue and their
+# metadata are maintained.
 [job_queue.state]
 type = "redis"
 addresses = ["localhost:6379"]
@@ -23,28 +29,34 @@ max_idle = 20
 dial_timeout = "1s"
 read_timeout = "1s"
 write_timeout = "1s"
-expiry = "3000s"
-meta_expiry = "3600s"
+expiry = "86400s"
+meta_expiry = "86400s"
 
-[results.my_results]
+# DuckDB compute engine limits (per worker job)
+[duckdb]
+threads_per_job = 2
+memory_limit_per_job = "2GB"
+
+# DuckLake configuration: Parquet file destination and metadata catalog.
+[ducklake]
+# Catalog DSN: PostgreSQL or SQLite
+catalog = "ducklake:postgres:dbname=ducklake_catalog host=127.0.0.1 user=postgres password=secret port=5432 sslmode=disable"
+# Data path where Parquet files will be uploaded (S3 URI or local directory)
+data_path = "s3://reports-lakehouse/data/"
+
+# S3 Object Storage Configuration (Optional: leave empty to use IAM / environment credentials)
+s3_region = "us-east-1"
+s3_endpoint = "s3.amazonaws.com"
+s3_use_ssl = true
+s3_access_key = ""
+s3_secret_key = ""
+
+# Source databases against which SQL queries are executed.
+# Currently supported types: "postgres" and "mysql".
+[sources.pg_orders]
 type = "postgres"
-dsn = "postgres://testUser:testPass@127.0.0.1:5432/testDB?sslmode=disable"
-max_idle = 10
-max_active = 100
-connect_timeout = "10s"
-results_table = "results_%s"
+dsn = "dbname=production host=127.0.0.1 user=postgres password=secret port=5432 sslmode=disable"
 
-[db.my_db]
-type = "postgres"
-dsn = "postgres://testUser:testPass@127.0.0.1:5432/testDB?sslmode=disable"
-max_idle = 10
-max_active = 100
-connect_timeout = "10s"
-
-# URL-encode ClickHouse query values (e.g. % as %25, + as %2B).
-[db.ch_db]
-type = "clickhouse"
-dsn = "tcp://127.0.0.1:9000?username=default&password=&database=default"
-max_idle = 10
-max_active = 100
-connect_timeout = "10s"
+[sources.mysql_users]
+type = "mysql"
+dsn = "root:secret@tcp(127.0.0.1:3306)/production"

@@ -17,8 +17,7 @@ import (
 	"github.com/knadh/koanf/v2"
 	flag "github.com/spf13/pflag"
 	"github.com/zerodha/dungbeetle/v2/internal/core"
-	"github.com/zerodha/dungbeetle/v2/internal/dbpool"
-	"github.com/zerodha/dungbeetle/v2/internal/resultbackends/sqldb"
+	"github.com/zerodha/dungbeetle/v2/internal/engine"
 )
 
 var (
@@ -30,7 +29,7 @@ func initFlags(ko *koanf.Koanf) {
 	// Command line flags.
 	f := flag.NewFlagSet("config", flag.ContinueOnError)
 	f.Usage = func() {
-		log.Info("DungBeetle")
+		log.Info("DuckBeetle")
 		log.Info(f.FlagUsages())
 		os.Exit(0)
 	}
@@ -129,7 +128,7 @@ func initHTTP(h *Handlers, ko *koanf.Koanf) {
 
 	// Register HTTP handlers.
 	r.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		h.sendResponse(w, fmt.Sprintf("dungbeetle %s", buildString))
+		h.sendResponse(w, fmt.Sprintf("duckbeetle %s", buildString))
 	})
 	r.Get("/tasks", h.GetTasksList)
 	r.Post("/tasks/{taskName}/jobs", h.handlePostJob)
@@ -141,63 +140,55 @@ func initHTTP(h *Handlers, ko *koanf.Koanf) {
 	r.Get("/groups/{groupID}", h.handleGetGroupStatus)
 	r.Get("/metrics", h.handleGetMetrics)
 
-	log.Info("starting HTTP server", "address", ko.String("server"))
-	if err := http.ListenAndServe(ko.String("server"), r); err != nil {
+	srvAddr := ko.String("server.bind")
+	if srvAddr == "" {
+		srvAddr = ko.String("server")
+	}
+	if srvAddr == "" {
+		srvAddr = "127.0.0.1:6060"
+	}
+
+	log.Info("starting HTTP server", "address", srvAddr)
+	if err := http.ListenAndServe(srvAddr, r); err != nil {
 		log.Error("shutting down http server", "error", err)
 	}
 	os.Exit(0)
 }
 
 func initCore(ko *koanf.Koanf) (*core.Core, error) {
-	// Source DBs config.
-	var srcDBs map[string]dbpool.Config
-	if err := ko.Unmarshal("db", &srcDBs); err != nil {
-		log.Error("error reading source DB config", "error", err)
-		return nil, fmt.Errorf("error reading source DB config : %w", err)
-	}
-	if len(srcDBs) == 0 {
-		log.Error("found 0 source databases in config")
-		return nil, fmt.Errorf("found 0 source databases in config")
-	}
-
-	// Result DBs config.
-	var resDBs map[string]dbpool.Config
-	if err := ko.Unmarshal("results", &resDBs); err != nil {
-		return nil, fmt.Errorf("error reading source DB config: %w", err)
-	}
-	if len(resDBs) == 0 {
-		return nil, fmt.Errorf("found 0 result backends in config")
+	// 1. DuckLake Configuration
+	lakeCfg := engine.DuckLakeConfig{
+		Catalog:     ko.MustString("ducklake.catalog"),
+		DataPath:    ko.MustString("ducklake.data_path"),
+		S3Region:    ko.String("ducklake.s3_region"),
+		S3Endpoint:  ko.String("ducklake.s3_endpoint"),
+		S3AccessKey: ko.String("ducklake.s3_access_key"),
+		S3SecretKey: ko.String("ducklake.s3_secret_key"),
+		S3UseSSL:    ko.Bool("ducklake.s3_use_ssl"),
+		S3URLStyle:  ko.String("ducklake.s3_url_style"),
 	}
 
-	// Connect to source DBs.
-	srcPool, err := dbpool.New(srcDBs)
-	if err != nil {
-		return nil, err
+	// 2. Sources Configuration (PostgreSQL and MySQL)
+	var sources map[string]engine.SourceConfig
+	if err := ko.Unmarshal("sources", &sources); err != nil {
+		log.Error("error reading sources config", "error", err)
+		return nil, fmt.Errorf("error reading sources config: %w", err)
+	}
+	if len(sources) == 0 {
+		log.Error("found 0 source databases in config under [sources]")
+		return nil, fmt.Errorf("found 0 source databases in config under [sources]")
 	}
 
-	// Connect to result DBs.
-	resPool, err := dbpool.New(resDBs)
-	if err != nil {
-		return nil, err
+	// 3. Initialize DuckDB Engine
+	engCfg := engine.Config{
+		ThreadsPerJob:     ko.Int("duckdb.threads_per_job"),
+		MemoryLimitPerJob: ko.String("duckdb.memory_limit_per_job"),
+		DuckLake:          lakeCfg,
+		Sources:           sources,
 	}
+	eng := engine.New(engCfg, log)
 
-	// Initialize the result backend controller for every backend.
-	backends := make(core.ResultBackends)
-	for name, db := range resPool {
-		opt := sqldb.Opt{
-			DBType:         resDBs[name].Type,
-			ResultsTable:   ko.MustString(fmt.Sprintf("results.%s.results_table", name)),
-			UnloggedTables: resDBs[name].Unlogged,
-		}
-
-		backend, err := sqldb.NewSQLBackend(db, opt, log)
-		if err != nil {
-			return nil, fmt.Errorf("error initializing result backend: %w", err)
-		}
-
-		backends[name] = backend
-	}
-
+	// 4. Broker / Results Queue (Redis via Tasqueue)
 	if v := ko.MustString("job_queue.broker.type"); v != "redis" {
 		return nil, fmt.Errorf("unsupported job_queue.broker.type '%s'. Only 'redis' is supported.", v)
 	}
@@ -229,14 +220,15 @@ func initCore(ko *koanf.Koanf) (*core.Core, error) {
 		MetaExpiry:   ko.Duration("job_queue.state.meta_expiry"),
 	}, lo)
 
-	// Initialize the server and load SQL tasks.
+	// 5. Initialize Core
 	co := core.New(core.Opt{
 		DefaultQueue:            ko.MustString("queue"),
 		DefaultGroupConcurrency: ko.MustInt("worker-concurrency"),
 		DefaultJobTTL:           ko.MustDuration("app.default_job_ttl"),
 		Results:                 rResult,
 		Broker:                  rBroker,
-	}, srcPool, backends, lo)
+	}, eng, lo)
+
 	if err := co.LoadTasks(ko.MustStrings("sql-directory")); err != nil {
 		return nil, fmt.Errorf("error loading tasks : %w", err)
 	}
