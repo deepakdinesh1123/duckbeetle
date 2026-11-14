@@ -53,6 +53,53 @@ type Config struct {
 	Sources           map[string]SourceConfig `koanf:"sources"`
 }
 
+// Slot represents a dedicated worker concurrency slot with its own isolated, long-lived DuckDB instance.
+// Concurrency is managed via Slot tokens in slotPool, keeping connection health decoupled from semaphore tokens.
+type Slot struct {
+	id uint32
+	db *sql.DB
+	mu sync.Mutex
+}
+
+// getOrConnect returns the slot's DuckDB instance, lazily reconnecting if currently nil or invalidated.
+func (s *Slot) getOrConnect(ctx context.Context, e *DuckDBEngine) (*sql.DB, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db != nil {
+		return s.db, nil
+	}
+
+	db, err := e.createInitializedSlotDB(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("slot %d: failed to initialize duckdb instance: %w", s.id, err)
+	}
+	s.db = db
+	return s.db, nil
+}
+
+// invalidate closes and resets the slot's DuckDB instance when a fatal connection or catalog error occurs.
+func (s *Slot) invalidate() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db != nil {
+		_ = s.db.Close()
+		s.db = nil
+	}
+}
+
+// close cleanly closes the slot's DuckDB instance during engine shutdown.
+func (s *Slot) close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db != nil {
+		_ = s.db.Close()
+		s.db = nil
+	}
+}
+
 // DuckDBEngine manages executing jobs against source databases with DuckLake outputs.
 // It uses a Per-Slot Long-Lived DuckDB Instance pool combined with direct streaming `COPY ... TO` Parquet
 // and a PostgreSQL Advisory Lock around `ducklake_add_data_files` to achieve zero temp-table memory bloat
@@ -60,9 +107,12 @@ type Config struct {
 type DuckDBEngine struct {
 	cfg           Config
 	lo            *slog.Logger
-	slotPool      chan *sql.DB
+	slots         []*Slot
+	slotsMu       sync.Mutex
+	slotPool      chan *Slot
 	catalogLockDB *sql.DB
 	catalogMu     sync.Mutex
+	closed        bool
 }
 
 // Validate checks engine configuration at startup and fails fast if required parameters are missing.
@@ -150,16 +200,18 @@ func New(cfg Config, lo *slog.Logger) (*DuckDBEngine, error) {
 		eng.catalogLockDB = lockDB
 	}
 
-	eng.slotPool = make(chan *sql.DB, cfg.PoolSize)
+	eng.slots = make([]*Slot, 0, cfg.PoolSize)
+	eng.slotPool = make(chan *Slot, cfg.PoolSize)
 	ctx := context.Background()
 
 	for i := 0; i < cfg.PoolSize; i++ {
-		db, err := eng.createInitializedSlotDB(ctx)
-		if err != nil {
+		slot := &Slot{id: uint32(i + 1)}
+		if _, err := slot.getOrConnect(ctx, eng); err != nil {
 			eng.Close()
 			return nil, fmt.Errorf("failed to initialize duckdb slot %d/%d: %w", i+1, cfg.PoolSize, err)
 		}
-		eng.slotPool <- db
+		eng.slots = append(eng.slots, slot)
+		eng.slotPool <- slot
 	}
 
 	lo.Info("initialized dedicated duckdb worker slots", "slots", cfg.PoolSize, "threads_per_slot", cfg.ThreadsPerJob, "memory_per_slot", cfg.MemoryLimitPerJob)
@@ -212,6 +264,12 @@ func (e *DuckDBEngine) createInitializedSlotDB(ctx context.Context) (*sql.DB, er
 		if _, err := db.ExecContext(ctx, secretSQL); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to configure s3 secret: %w", err)
+		}
+		// Cache HTTP HEAD / Parquet footer metadata in memory so read_parquet and ducklake_add_data_files
+		// do not make duplicate S3 network round-trips for the same file.
+		if _, err := db.ExecContext(ctx, "SET enable_http_metadata_cache = true;"); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to enable http metadata cache: %w", err)
 		}
 	}
 
@@ -304,17 +362,34 @@ func (e *DuckDBEngine) acquireCatalogLock(ctx context.Context) (func(), error) {
 
 // Close gracefully closes all worker slot DuckDB instances and the catalog lock connection.
 func (e *DuckDBEngine) Close() {
+	e.slotsMu.Lock()
+	if e.closed {
+		e.slotsMu.Unlock()
+		return
+	}
+	e.closed = true
+
+	// Drain any idle slot tokens from the pool channel so no future borrows succeed
 	if e.slotPool != nil {
 	drainLoop:
 		for {
 			select {
-			case db := <-e.slotPool:
-				_ = db.Close()
+			case <-e.slotPool:
 			default:
 				break drainLoop
 			}
 		}
 	}
+
+	// Close all slots directly from the tracked slice
+	for _, slot := range e.slots {
+		if slot != nil {
+			slot.close()
+		}
+	}
+	e.slots = nil
+	e.slotsMu.Unlock()
+
 	if e.catalogLockDB != nil {
 		_ = e.catalogLockDB.Close()
 	}
@@ -339,6 +414,13 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 	if e.cfg.ServerOnly || e.slotPool == nil {
 		return models.JobResultPayload{}, fmt.Errorf("cannot execute job: engine is running in server-only mode")
 	}
+	e.slotsMu.Lock()
+	if e.closed {
+		e.slotsMu.Unlock()
+		return models.JobResultPayload{}, fmt.Errorf("cannot execute job: engine is closed")
+	}
+	e.slotsMu.Unlock()
+
 	if !reSafeIdentifier.MatchString(jobID) {
 		return models.JobResultPayload{}, fmt.Errorf("invalid characters in job_id: %s", jobID)
 	}
@@ -349,10 +431,10 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 		return models.JobResultPayload{}, fmt.Errorf("unknown source db '%s'", sourceDB)
 	}
 
-	// Checkout a dedicated, pre-warmed long-lived slot instance
-	var db *sql.DB
+	// Checkout a dedicated, pre-warmed long-lived slot token
+	var slot *Slot
 	select {
-	case db = <-e.slotPool:
+	case slot = <-e.slotPool:
 	case <-ctx.Done():
 		return models.JobResultPayload{}, ctx.Err()
 	}
@@ -360,19 +442,24 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 	slotHealthy := true
 	defer func() {
 		if !slotHealthy {
-			_ = db.Close()
-			if freshDB, err := e.createInitializedSlotDB(context.Background()); err == nil {
-				e.slotPool <- freshDB
-				return
-			}
-			// Fallback to an uninitialized handle if replacement fails so slotPool never deadlocks
-			if fallbackDB, err := sql.Open("duckdb", ""); err == nil {
-				e.slotPool <- fallbackDB
-				return
-			}
+			slot.invalidate()
 		}
-		e.slotPool <- db
+
+		e.slotsMu.Lock()
+		defer e.slotsMu.Unlock()
+
+		if e.closed {
+			slot.close()
+			return
+		}
+		e.slotPool <- slot
 	}()
+
+	db, err := slot.getOrConnect(ctx, e)
+	if err != nil {
+		slotHealthy = false
+		return models.JobResultPayload{}, fmt.Errorf("failed to obtain slot connection: %w", err)
+	}
 
 	// 1. Switch active context to sourceDB so unqualified table names resolve directly
 	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE %s;", sourceDB)); err != nil {

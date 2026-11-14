@@ -169,4 +169,49 @@ func TestDuckLakeS3ConfigValidation(t *testing.T) {
 	_, err = New(cfg, nil)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "must be configured together")
+
+	// Verify valid S3 config initializes CREATE SECRET + enable_http_metadata_cache cleanly
+	tempDir := t.TempDir()
+	cfg.DuckLake.Catalog = "ducklake:" + filepath.Join(tempDir, "s3_catalog.db")
+	cfg.DuckLake.S3SecretKey = "secret_key"
+	cfg.Sources = nil
+	eng, err := New(cfg, nil)
+	require.NoError(t, err)
+	eng.Close()
+}
+
+func TestEngineCloseIdempotentAndRejectsJobs(t *testing.T) {
+	tempDir := t.TempDir()
+	sourceFile := filepath.Join(tempDir, "source.duckdb")
+	catalogFile := filepath.Join(tempDir, "catalog.duckdb")
+	dataPath := filepath.Join(tempDir, "data")
+	require.NoError(t, os.MkdirAll(dataPath, 0755))
+
+	sdb, err := sql.Open("duckdb", sourceFile)
+	require.NoError(t, err)
+	_, err = sdb.Exec("CREATE TABLE t1 (id INT); INSERT INTO t1 VALUES (1);")
+	require.NoError(t, err)
+	sdb.Close()
+
+	cfg := Config{
+		DuckLake: DuckLakeConfig{
+			Catalog:  "ducklake:" + catalogFile,
+			DataPath: dataPath,
+		},
+		Sources: map[string]SourceConfig{
+			"db1": {Type: "duckdb", DSN: sourceFile},
+		},
+	}
+	eng, err := New(cfg, nil)
+	require.NoError(t, err)
+
+	// Close engine
+	eng.Close()
+	// Idempotent second close must not panic
+	eng.Close()
+
+	// Subsequent job must fail immediately
+	_, err = eng.ExecuteJob(context.Background(), "job_after_close", "db1", "SELECT * FROM t1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "engine is closed")
 }
