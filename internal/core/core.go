@@ -2,12 +2,12 @@ package core
 
 import (
 	"context"
-	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"regexp"
-	"strconv"
 	"sync"
 	"time"
 
@@ -15,7 +15,7 @@ import (
 	uuid "github.com/gofrs/uuid/v5"
 	"github.com/kalbhor/tasqueue/v2"
 	"github.com/vmihailenco/msgpack"
-	"github.com/zerodha/dungbeetle/v2/internal/dbpool"
+	"github.com/zerodha/dungbeetle/v2/internal/engine"
 	"github.com/zerodha/dungbeetle/v2/models"
 )
 
@@ -35,14 +35,11 @@ type Opt struct {
 type Core struct {
 	opt Opt
 
+	// DuckDB 2.0 Engine
+	engine *engine.DuckDBEngine
+
 	// Named SQL query tasks.
 	tasks Tasks
-
-	// Pool of source data DBs.
-	srcDBs dbpool.Pool
-
-	// Named map of one or more result backend DBs.
-	resultBackends ResultBackends
 
 	// Distributed queue system.
 	q *tasqueue.Server
@@ -58,16 +55,15 @@ type Core struct {
 }
 
 // New returns a new instance of Core.
-func New(o Opt, srcDBs dbpool.Pool, res ResultBackends, lo *slog.Logger) *Core {
+func New(o Opt, eng *engine.DuckDBEngine, lo *slog.Logger) *Core {
 	return &Core{
-		opt:            o,
-		tasks:          make(Tasks),
-		srcDBs:         srcDBs,
-		resultBackends: res,
-		jobCtx:         make(map[string]context.CancelFunc),
-		mu:             sync.RWMutex{},
-		metrics:        metrics.NewSet(),
-		lo:             lo,
+		opt:     o,
+		engine:  eng,
+		tasks:   make(Tasks),
+		jobCtx:  make(map[string]context.CancelFunc),
+		mu:      sync.RWMutex{},
+		metrics: metrics.NewSet(),
+		lo:      lo,
 	}
 }
 
@@ -78,15 +74,22 @@ func (co *Core) Metrics() *metrics.Set {
 
 // Start is a blocking function that spawns the queue workers and starts processing jobs.
 // This should be invoked last after all other initializations are done.
+// Start initializes the distributed queue system and starts workers.
 func (co *Core) Start(ctx context.Context, workerName string, concurrency int) error {
-	// Initialize the distributed queue system.
+	if err := co.InitQueue(); err != nil {
+		return err
+	}
+	co.q.Start(ctx)
+	return nil
+}
+
+// InitQueue initializes the tasqueue server without starting worker polling.
+func (co *Core) InitQueue() error {
 	qs, err := co.initQueue()
 	if err != nil {
 		return err
 	}
 	co.q = qs
-	qs.Start(ctx)
-
 	return nil
 }
 
@@ -103,14 +106,14 @@ func (co *Core) NewJob(j models.JobReq, taskName string) (models.JobResp, error)
 	}
 
 	// Create the job.
-	uuid, err := co.q.Enqueue(context.Background(), sig)
+	jobUUID, err := co.q.Enqueue(context.Background(), sig)
 	if err != nil {
 		return models.JobResp{}, err
 	}
 	co.metrics.GetOrCreateCounter(metricName(metricJobsEnqueued, "task_name", taskName)).Inc()
 
 	return models.JobResp{
-		JobID:    uuid,
+		JobID:    jobUUID,
 		TaskName: sig.Task,
 		Queue:    sig.Opts.Queue,
 		Retries:  int(sig.Opts.MaxRetries),
@@ -196,12 +199,10 @@ func (co *Core) GetJobStatus(jobID string) (models.JobStatusResp, error) {
 		return models.JobStatusResp{}, err
 	}
 
-	var rowCount int
-	if string(res) != "" {
-		rowCount, err = strconv.Atoi(string(res))
-		if err != nil {
-			co.lo.Error("error converting row count to int", "error", err)
-			return models.JobStatusResp{}, err
+	var payload models.JobResultPayload
+	if len(res) > 0 {
+		if err := json.Unmarshal(res, &payload); err != nil {
+			co.lo.Error("error unmarshaling job result payload", "error", err, "job_id", jobID)
 		}
 	}
 
@@ -212,10 +213,14 @@ func (co *Core) GetJobStatus(jobID string) (models.JobStatusResp, error) {
 	}
 
 	return models.JobStatusResp{
-		JobID: out.ID,
-		State: state,
-		Error: out.PrevErr,
-		Count: rowCount,
+		JobID:     out.ID,
+		State:     state,
+		Count:     payload.Count,
+		Table:     payload.Table,
+		Catalog:   payload.Catalog,
+		Files:     payload.Files,
+		SizeBytes: payload.SizeBytes,
+		Error:     out.PrevErr,
 	}, nil
 }
 
@@ -240,7 +245,6 @@ func (co *Core) GetJobGroupStatus(groupID string) (models.GroupStatusResp, error
 		}
 
 		jobs = append(jobs, jobResp)
-
 	}
 
 	state, err := getState(groupMsg.Status)
@@ -288,16 +292,13 @@ func (co *Core) CancelJob(jobID string, purge bool) error {
 
 // CancelJobGroup cancels a pending group job by individually cancelling all pending jobs in it.
 func (co *Core) CancelJobGroup(groupID string, purge bool) error {
-	// Get state of group.
 	res, err := co.GetJobGroupStatus(groupID)
 	if err != nil {
 		co.lo.Error("error fetching group status", "error", err)
 		return errors.New("error fetching group status")
 	}
 
-	// If purge is set to false, delete job only if isn't completed yet.
 	if !purge {
-		// Get state of group ID to check if it has been completed or not.
 		s, err := co.q.GetGroup(context.Background(), groupID)
 		if err == tasqueue.ErrNotFound {
 			return fmt.Errorf("group not found")
@@ -306,20 +307,12 @@ func (co *Core) CancelJobGroup(groupID string, purge bool) error {
 			return err
 		}
 
-		// If the job is already complete, no go.
 		if s.Status == tasqueue.StatusDone || s.Status == tasqueue.StatusFailed {
 			return errors.New("can't delete group as it's already complete")
 		}
 	}
 
-	// Loop through every job of the group and purge them.
 	for _, j := range res.Jobs {
-		if err != nil {
-			co.lo.Error("error fetching job", "error", err)
-			return errors.New("error fetching job from group")
-		}
-
-		// Stop the job if it's running.
 		co.mu.RLock()
 		cancel, ok := co.jobCtx[j.JobID]
 		co.mu.RUnlock()
@@ -327,7 +320,6 @@ func (co *Core) CancelJobGroup(groupID string, purge bool) error {
 			cancel()
 		}
 
-		// Delete the job.
 		if err := co.q.DeleteJob(context.Background(), j.JobID); err != nil {
 			co.lo.Error("error deleting job", "error", err)
 			return fmt.Errorf("error deleting job: %v", err)
@@ -337,7 +329,6 @@ func (co *Core) CancelJobGroup(groupID string, purge bool) error {
 	return nil
 }
 
-// makeJob creates and returns a tasqueue job (tasqueue.Job{}) from the given job params.
 func (co *Core) makeJob(j models.JobReq, taskName string) (tasqueue.Job, error) {
 	if j.JobID != "" && !reJobID.MatchString(j.JobID) {
 		return tasqueue.Job{}, errors.New("invalid characters in the `job_id`")
@@ -348,7 +339,10 @@ func (co *Core) makeJob(j models.JobReq, taskName string) (tasqueue.Job, error) 
 		return tasqueue.Job{}, fmt.Errorf("unrecognized task: %s", taskName)
 	}
 
-	// Check if a job with the same ID is already running.
+	if j.DB != "" && !task.HasDB(j.DB) {
+		return tasqueue.Job{}, fmt.Errorf("unrecognized source DB '%s' for task '%s'", j.DB, taskName)
+	}
+
 	msg, err := co.q.GetJob(context.Background(), j.JobID)
 	if err != nil && !errors.Is(err, tasqueue.ErrNotFound) {
 		return tasqueue.Job{}, fmt.Errorf("error fetching job status (id='%s')", j.JobID)
@@ -358,10 +352,6 @@ func (co *Core) makeJob(j models.JobReq, taskName string) (tasqueue.Job, error) 
 		return tasqueue.Job{}, fmt.Errorf("job '%s' is already running", j.JobID)
 	}
 
-	// If there's no job_id, we generate one. This is because
-	// the ID Machinery generates is not made available inside the
-	// actual task. So, we generate the ID and pass it as an argument
-	// to the task itself.
 	if j.JobID == "" {
 		uid, err := uuid.NewV4()
 		if err != nil {
@@ -386,8 +376,6 @@ func (co *Core) makeJob(j models.JobReq, taskName string) (tasqueue.Job, error) 
 		eta = e
 	}
 
-	// If there's no queue in the request, use the one attached to the task,
-	// if there's any (Machinery will use the default queue otherwise).
 	if j.Queue == "" {
 		j.Queue = task.Queue
 	}
@@ -421,20 +409,13 @@ func (co *Core) makeJob(j models.JobReq, taskName string) (tasqueue.Job, error) 
 }
 
 type taskMeta struct {
-	Args []interface{} `json:"args"`
-	DB   string        `json:"db"`
-	TTL  int           `json:"ttl"`
-
-	// ReadyAt is when the job became runnable (enqueue time or ETA). Zero for jobs enqueued by older versions.
-	ReadyAt time.Time `json:"ready_at"`
+	Args    []interface{} `json:"args"`
+	DB      string        `json:"db"`
+	TTL     int           `json:"ttl"`
+	ReadyAt time.Time     `json:"ready_at"`
 }
 
-// initQueue creates and returns a distributed queue system (Tasqueue) and registers
-// Tasks (SQL queries) to be executed. The queue system uses a broker (eg: Kafka) and stores
-// job states in a state store (eg: Redis)
 func (co *Core) initQueue() (*tasqueue.Server, error) {
-	var err error
-	// TODO: set log level
 	qs, err := tasqueue.NewServer(tasqueue.ServerOpts{
 		Broker:  co.opt.Broker,
 		Results: co.opt.Results,
@@ -444,7 +425,6 @@ func (co *Core) initQueue() (*tasqueue.Server, error) {
 		return nil, err
 	}
 
-	// Register every SQL ready tasks in the queue system as a job function.
 	for name := range co.tasks {
 		query := co.tasks[name]
 		co.registerQueueMetrics(query.Queue, query.Conc)
@@ -464,7 +444,6 @@ func (co *Core) initQueue() (*tasqueue.Server, error) {
 				switch {
 				case err == nil:
 					succeeded.Inc()
-				// A deleted job's state is gone from the store, so GetJob returns ErrNotFound.
 				case errors.Is(err, errJobCanceled), errors.Is(err, tasqueue.ErrNotFound):
 					canceled.Inc()
 				default:
@@ -481,7 +460,6 @@ func (co *Core) initQueue() (*tasqueue.Server, error) {
 				return fmt.Errorf("could not unmarshal args : %w", err)
 			}
 
-			// Retries are re-enqueued right after a failed attempt, so only the first attempt measures queue wait.
 			if jctx.Meta.Retried == 0 && !args.ReadyAt.IsZero() {
 				wait := max(time.Since(args.ReadyAt), 0)
 				co.metrics.GetOrCreatePrometheusHistogramExt(
@@ -490,15 +468,19 @@ func (co *Core) initQueue() (*tasqueue.Server, error) {
 				).Update(wait.Seconds())
 			}
 
-			var count int64
 			start := time.Now()
-			count, err = co.execJob(jctx.Meta.ID, name, args.DB, time.Duration(args.TTL)*time.Second, args.Args, query)
+			payload, err := co.execJob(jctx.Meta.ID, name, args.DB, args.Args, query)
 			execTime.UpdateDuration(start)
 			if err != nil {
 				return fmt.Errorf("could not execute job : %w", err)
 			}
 
-			return jctx.Save([]byte(strconv.Itoa(int(count))))
+			bPayload, err := json.Marshal(payload)
+			if err != nil {
+				return fmt.Errorf("could not marshal result payload: %w", err)
+			}
+
+			return jctx.Save(bPayload)
 		}, tasqueue.TaskOpts{
 			Concurrency: uint32(query.Conc),
 			Queue:       query.Queue,
@@ -511,17 +493,25 @@ func (co *Core) initQueue() (*tasqueue.Server, error) {
 	return qs, nil
 }
 
-// errJobCanceled is returned when a job is deleted or canceled before or during execution.
 var errJobCanceled = errors.New("the job was canceled")
 
-// execJob executes an SQL statement job and inserts the results into the result backend.
-func (co *Core) execJob(jobID, taskName, dbName string, ttl time.Duration, args []interface{}, task Task) (int64, error) {
-	// If the job's deleted, stop.
+// execJob executes an SQL statement job directly via DuckDBEngine to DuckLake.
+func (co *Core) execJob(jobID, taskName, dbName string, args []interface{}, task Task) (models.JobResultPayload, error) {
 	if _, err := co.GetJobStatus(jobID); err != nil {
-		return 0, errJobCanceled
+		return models.JobResultPayload{}, errJobCanceled
 	}
 
-	// Execute the query.
+	// Determine source database:
+	// 1. Explicit DB in request (validated in makeJob)
+	// 2. Random DB from task.DBs (read replica load balancing)
+	sourceDB := dbName
+	if sourceDB == "" && len(task.DBs) > 0 {
+		sourceDB = task.DBs[rand.Intn(len(task.DBs))]
+	}
+	if sourceDB == "" {
+		return models.JobResultPayload{}, fmt.Errorf("no source database available for task '%s'", taskName)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer func() {
 		cancel()
@@ -535,103 +525,15 @@ func (co *Core) execJob(jobID, taskName, dbName string, ttl time.Duration, args 
 	co.jobCtx[jobID] = cancel
 	co.mu.Unlock()
 
-	var (
-		db  *sql.DB
-		err error
-	)
-	if dbName != "" {
-		db, err = task.DBs.Get(dbName)
-		if err != nil {
-			return 0, fmt.Errorf("task execution failed: %s: %v", task.Name, err)
-		}
-	} else {
-		_, db = task.DBs.GetRandom()
-	}
-	if db == nil {
-		return 0, fmt.Errorf("task execution failed: %s: no source DBs available", task.Name)
-	}
-
-	rows, err := db.QueryContext(ctx, task.Raw, args...)
+	payload, err := co.engine.ExecuteJob(ctx, jobID, sourceDB, task.Raw, args...)
 	if err != nil {
-		// Drivers report cancellation differently (eg: pq returns its own error), so check the context instead.
 		if ctx.Err() != nil {
-			return 0, errJobCanceled
+			return models.JobResultPayload{}, errJobCanceled
 		}
-
-		return 0, fmt.Errorf("task execution failed: %s: %v", task.Name, err)
-	}
-	defer rows.Close()
-
-	// Write the results to the results backend.
-	return co.writeResults(jobID, task, ttl, rows)
-}
-
-// writeResults writes results from an SQL query to a result backend.
-func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *sql.Rows) (int64, error) {
-	var numRows int64
-
-	// Get the results backend.
-	name, backend := task.ResultBackends.GetRandom()
-	co.lo.Info("sending results form", "job_id", jobID, "name", name)
-	w, err := backend.NewResultSet(jobID, task.Name, ttl)
-	if err != nil {
-		return numRows, fmt.Errorf("error writing columns to result backend: %v", err)
-	}
-	defer w.Close()
-
-	// Get the columns in the results.
-	cols, err := rows.Columns()
-	if err != nil {
-		return numRows, err
-	}
-	numCols := len(cols)
-
-	// If the column types for this particular taskName
-	// have not been registered, do it.
-	if !w.IsColTypesRegistered() {
-		colTypes, err := rows.ColumnTypes()
-		if err != nil {
-			return numRows, err
-		}
-
-		w.RegisterColTypes(cols, colTypes)
+		return models.JobResultPayload{}, fmt.Errorf("task execution failed: %s: %v", task.Name, err)
 	}
 
-	// Write the results columns / headers.
-	if err := w.WriteCols(cols); err != nil {
-		return numRows, fmt.Errorf("error writing columns to result backend: %v", err)
-	}
-
-	// Gymnastics to read arbitrary types from the row.
-	var (
-		resCols     = make([]interface{}, numCols)
-		resPointers = make([]interface{}, numCols)
-	)
-	for i := 0; i < numCols; i++ {
-		resPointers[i] = &resCols[i]
-	}
-
-	// Scan each row and write to the results backend.
-	for rows.Next() {
-		if err := rows.Scan(resPointers...); err != nil {
-			return numRows, err
-		}
-		if err := w.WriteRow(resCols); err != nil {
-			return numRows, fmt.Errorf("error writing row to result backend: %v", err)
-		}
-
-		numRows++
-	}
-
-	if err := rows.Err(); err != nil {
-		return numRows, fmt.Errorf("error reading source rows: %w", err)
-	}
-
-	if err := w.Flush(); err != nil {
-		return numRows, fmt.Errorf("error flushing results to result backend: %v", err)
-	}
-
-	return numRows, nil
+	return payload, nil
 }
 
 const (
@@ -642,8 +544,6 @@ const (
 	StatusRetry   = "RETRY"
 )
 
-// getState helps keep compatibility between different status conventions
-// of the job servers (tasqueue/machinery).
 func getState(st string) (string, error) {
 	switch st {
 	case tasqueue.StatusStarted:

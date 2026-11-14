@@ -5,17 +5,20 @@ BUILDSTR := ${VERSION} (build "\\\#"${LAST_COMMIT} $(shell date '+%Y-%m-%d %H:%M
 
 GOPATH ?= $(HOME)/go
 
-BIN := dungbeetle
+BIN := duckbeetle
 
-.PHONY: build
+.PHONY: build clean
+clean:
+	rm -f ${BIN}
+
 build: $(BIN)
 
 $(BIN): $(shell find . -type f -name "*.go")
-	CGO_ENABLED=0 go build -o ${BIN} -ldflags="-s -w -X 'main.buildString=${BUILDSTR}'" ./cmd/*.go
+	CGO_ENABLED=1 go build -o ${BIN} -ldflags="-s -w -X 'main.buildString=${BUILDSTR}'" ./cmd/*.go
 
 .PHONY: run
 run:
-	CGO_ENABLED=0 go run -ldflags="-s -w -X 'main.buildString=${BUILDSTR}'" ./cmd
+	CGO_ENABLED=1 go run -ldflags="-s -w -X 'main.buildString=${BUILDSTR}'" ./cmd
 
 .PHONY: dist
 dist: build

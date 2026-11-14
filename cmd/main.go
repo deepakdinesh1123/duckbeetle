@@ -10,11 +10,6 @@ import (
 	"github.com/knadh/koanf/providers/env"
 	"github.com/knadh/koanf/v2"
 	"github.com/zerodha/dungbeetle/v2/internal/core"
-
-	// Clickhouse, MySQL and Postgres drivers.
-	_ "github.com/ClickHouse/clickhouse-go"
-	_ "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
 )
 
 // Handlers holds all application dependencies
@@ -52,6 +47,8 @@ func main() {
 	mode := "full"
 	if ko.Bool("worker-only") {
 		mode = "worker only"
+	} else if ko.Bool("server-only") {
+		mode = "server only"
 	}
 
 	log.Info("starting server", "queue", ko.MustString("queue"), "mode", mode, "worker-name", ko.MustString("worker-name"))
@@ -76,7 +73,16 @@ func main() {
 
 	ctx := context.Background()
 
-	// Start the core.
+	// In server-only mode, only initialize queue for enqueuing and do not start worker polling.
+	if ko.Bool("server-only") {
+		if err := co.InitQueue(); err != nil {
+			log.Error("could not initialise queue", "error", err)
+			return
+		}
+		select {}
+	}
+
+	// Start the core workers.
 	if err := co.Start(ctx, ko.MustString("worker-name"), ko.MustInt("worker-concurrency")); err != nil {
 		log.Error("could not start core", "error", err)
 	}

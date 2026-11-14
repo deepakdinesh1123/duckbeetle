@@ -8,21 +8,29 @@ import (
 	"strings"
 
 	"github.com/knadh/goyesql/v2"
-	"github.com/zerodha/dungbeetle/v2/internal/dbpool"
 )
 
 // Task represents an SQL query task.
 type Task struct {
-	Name           string         `json:"name"`
-	Queue          string         `json:"queue"`
-	Conc           int            `json:"concurrency"`
-	Raw            string         `json:"raw,omitempty"`
-	DBs            dbpool.Pool    `json:"-"`
-	ResultBackends ResultBackends `json:"-"`
+	Name  string   `json:"name"`
+	Queue string   `json:"queue"`
+	Conc  int      `json:"concurrency"`
+	Raw   string   `json:"raw,omitempty"`
+	DBs   []string `json:"dbs,omitempty"`
 }
 
 // Tasks maps names to SQL query tasks.
 type Tasks map[string]Task
+
+// HasDB checks if the given db name is attached to this task.
+func (t Task) HasDB(name string) bool {
+	for _, db := range t.DBs {
+		if db == name {
+			return true
+		}
+	}
+	return false
+}
 
 // LoadTasks loads SQL queries from all the .sql files in a given directory.
 func (co *Core) LoadTasks(dirs []string) error {
@@ -48,7 +56,6 @@ func (co *Core) LoadTasks(dirs []string) error {
 }
 
 func (co *Core) loadTasks(dir string) (Tasks, error) {
-	// Discover .sql files.
 	files, err := filepath.Glob(path.Join(dir, "*.sql"))
 	if err != nil {
 		return nil, fmt.Errorf("unable to read SQL directory %s: %v", dir, err)
@@ -58,68 +65,33 @@ func (co *Core) loadTasks(dir string) (Tasks, error) {
 		return nil, fmt.Errorf("no SQL files found in %s", dir)
 	}
 
-	// Parse all discovered SQL files.
 	tasks := make(Tasks)
 	for _, f := range files {
 		q := goyesql.MustParseFile(f)
 
 		for name, s := range q {
-			var (
-				// A map of DBs are attached to every query. This can be
-				// DBs tagged specifically to queries in the SQL file,
-				// or will be the map of all avaliable DBs. During execution
-				// one of these DBs will be picked randomly.
-				srcDBs dbpool.Pool
-
-				srcPool ResultBackends
-			)
-
-			// Query already exists.
 			if _, ok := tasks[string(name)]; ok {
 				return nil, fmt.Errorf("duplicate query %s (%s)", name, f)
 			}
 
-			// Are there specific DB's tagged to the query?
-			if dbTag, ok := s.Tags["db"]; ok {
-				srcDBs, err = co.srcDBs.FilterByTags(strings.Split(dbTag, ","))
-				if err != nil {
-					return nil, fmt.Errorf("error loading query %s (%s): %v", name, f, err)
-				}
-			} else {
-				// No specific DBs. Attach all.
-				srcDBs = co.srcDBs
-			}
-
-			// Are there specific result backends tagged to the query?
-			if resTags, ok := s.Tags["results"]; ok {
-				srcPool, err = filterResultBackends(strings.Split(resTags, ","), co.resultBackends)
-				if err != nil {
-					return nil, fmt.Errorf("error loading query %s (%s): %v", name, f, err)
-				}
-			} else {
-				// No specific DBs. Attach all.
-				srcPool = co.resultBackends
-			}
-
-			// Prepare the statement?
-			typ := ""
-			if _, ok := s.Tags["raw"]; ok {
-				typ = "raw"
-			} else {
-				// Prepare and close statements to validate SQL against each source DB.
-				typ = "prepared"
-				for _, db := range srcDBs {
-					stmt, err := db.Prepare(s.Query)
-					if err != nil {
-						return nil, fmt.Errorf("error preparing SQL query %s: %v", name, err)
-					}
-					if err := stmt.Close(); err != nil {
-						co.lo.Error("error closing validation statement", "task", name, "error", err)
+			availableSources := co.engine.GetSources()
+			var taskDBs []string
+			if dbTag, ok := s.Tags["db"]; ok && strings.TrimSpace(dbTag) != "" {
+				for _, db := range strings.Split(dbTag, ",") {
+					if c := strings.TrimSpace(db); c != "" {
+						if _, ok := availableSources[c]; !ok {
+							return nil, fmt.Errorf("unrecognized source DB '%s' in %s (task: %s)", c, f, name)
+						}
+						taskDBs = append(taskDBs, c)
 					}
 				}
+			} else {
+				// If no specific DBs are attached to the query, attach all available DBs (DungBeetle behavior)
+				for sName := range availableSources {
+					taskDBs = append(taskDBs, sName)
+				}
 			}
 
-			// Is there a queue?
 			queue := co.opt.DefaultQueue
 			if v, ok := s.Tags["queue"]; ok {
 				queue = strings.TrimSpace(v)
@@ -127,20 +99,20 @@ func (co *Core) loadTasks(dir string) (Tasks, error) {
 
 			conc := co.opt.DefaultGroupConcurrency
 			if v, ok := s.Tags["conc"]; ok {
+				var err error
 				conc, err = strconv.Atoi(strings.TrimSpace(v))
 				if err != nil {
 					return nil, err
 				}
 			}
 
-			co.lo.Info("loading task", "task", name, "type", typ, "db", srcDBs.GetNames(), "results", srcPool.GetNames(), "queue", queue)
+			co.lo.Info("loading task", "task", name, "db", taskDBs, "queue", queue)
 			tasks[name] = Task{
-				Name:           name,
-				Queue:          queue,
-				Conc:           conc,
-				Raw:            s.Query,
-				DBs:            srcDBs,
-				ResultBackends: srcPool,
+				Name:  name,
+				Queue: queue,
+				Conc:  conc,
+				Raw:   s.Query,
+				DBs:   taskDBs,
 			}
 		}
 	}

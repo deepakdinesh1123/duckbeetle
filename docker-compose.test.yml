@@ -1,52 +1,99 @@
 services:
   redis:
     image: redis:7-alpine
-    container_name: dungbeetle-test-redis
+    container_name: duckbeetle-test-redis
     ports:
       - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 5
     networks:
-      - dungbeetle-test
+      - duckbeetle-test
 
   postgres:
-    image: postgres:15-alpine
-    container_name: dungbeetle-test-postgres
+    image: postgres:15
+    container_name: duckbeetle-test-postgres
     environment:
       POSTGRES_PASSWORD: testPass
       POSTGRES_USER: testUser
       POSTGRES_DB: testDB
+    volumes:
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U testUser -d testDB"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 5s
+      timeout: 3s
+      retries: 10
     networks:
-      - dungbeetle-test
+      - duckbeetle-test
 
   mysql:
     image: mysql:8.0
-    container_name: dungbeetle-test-mysql
+    container_name: duckbeetle-test-mysql
     environment:
       MYSQL_ROOT_PASSWORD: rootpassword
       MYSQL_DATABASE: mydb
       MYSQL_USER: user
       MYSQL_PASSWORD: userpassword
+    volumes:
+      - ./scripts/init_mysql.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "3306:3306"
     healthcheck:
       test: ["CMD", "mysql", "--protocol=TCP", "-h", "127.0.0.1", "-u", "root", "--password=rootpassword", "-e", "SELECT 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      interval: 5s
+      timeout: 3s
+      retries: 15
     networks:
-      - dungbeetle-test
+      - duckbeetle-test
+
+  minio:
+    image: elestio/minio:latest
+    container_name: duckbeetle-test-minio
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["mkdir -p /data/reports-bucket && minio server /data --console-address :9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - duckbeetle-test
+
+  duckbeetle:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: duckbeetle:test
+    container_name: duckbeetle-app
+    ports:
+      - "6060:6060"
+    volumes:
+      - ./config.docker.toml:/opt/config/duckbeetle.toml:ro
+      - ./sql:/app/sql:ro
+    command: ["./duckbeetle", "--config", "/opt/config/duckbeetle.toml", "--sql-directory", "/app/sql"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks:
+      - duckbeetle-test
 
 networks:
-  dungbeetle-test:
+  duckbeetle-test:
     driver: bridge
