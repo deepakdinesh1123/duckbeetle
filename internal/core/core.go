@@ -74,15 +74,22 @@ func (co *Core) Metrics() *metrics.Set {
 
 // Start is a blocking function that spawns the queue workers and starts processing jobs.
 // This should be invoked last after all other initializations are done.
+// Start initializes the distributed queue system and starts workers.
 func (co *Core) Start(ctx context.Context, workerName string, concurrency int) error {
-	// Initialize the distributed queue system.
+	if err := co.InitQueue(); err != nil {
+		return err
+	}
+	co.q.Start(ctx)
+	return nil
+}
+
+// InitQueue initializes the tasqueue server without starting worker polling.
+func (co *Core) InitQueue() error {
 	qs, err := co.initQueue()
 	if err != nil {
 		return err
 	}
 	co.q = qs
-	qs.Start(ctx)
-
 	return nil
 }
 

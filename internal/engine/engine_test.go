@@ -88,8 +88,7 @@ func TestDuckDBEngineExecuteJob(t *testing.T) {
 		},
 		Sources: map[string]SourceConfig{
 			"orders_db": {
-				// DuckDB ATTACH handles duckdb file paths directly
-				Type: "postgres", // we will test with duckdb attached file
+				Type: "duckdb",
 				DSN:  sourceFile,
 			},
 		},
@@ -97,35 +96,53 @@ func TestDuckDBEngineExecuteJob(t *testing.T) {
 
 	eng, err := New(cfg, nil)
 	require.NoError(t, err)
+	defer eng.Close()
 	require.Equal(t, "ducklake:"+catalogFile, eng.GetCatalog())
 
-	// Execute job
 	ctx := context.Background()
-	// To test attach cleanly with standard file:
-	db, err := sql.Open("duckdb", "")
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, "ATTACH 'ducklake:"+catalogFile+"' AS lake (DATA_PATH '"+dataPath+"', DATA_INLINING_ROW_LIMIT 0)")
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, "ATTACH '"+sourceFile+"' AS orders_db")
-	require.NoError(t, err)
-	_, err = db.ExecContext(ctx, "USE orders_db")
-	require.NoError(t, err)
+	for i := 1; i <= 6; i++ {
+		jobID := "job99" + string(rune('0'+i))
+		res, err := eng.ExecuteJob(ctx, jobID, "orders_db", "SELECT * FROM entries WHERE user_id = ?", "USR1")
+		require.NoError(t, err, "failed on iteration %d (%s)", i, jobID)
+		require.Equal(t, int64(2), res.Count)
+		require.NotEmpty(t, res.Files)
+		require.Greater(t, res.SizeBytes, int64(0))
+		t.Logf("Slot iteration %d verified! Results: %d rows, File: %v (%d bytes)", i, res.Count, res.Files, res.SizeBytes)
+	}
 
-	_, err = db.ExecContext(ctx, "CREATE TABLE lake.results_job999 AS SELECT * FROM entries WHERE user_id = ?", "USR1")
+	// Verify idempotent retry with duplicate jobID
+	retryRes, err := eng.ExecuteJob(ctx, "job991", "orders_db", "SELECT * FROM entries WHERE user_id = ?", "USR2")
 	require.NoError(t, err)
+	require.Equal(t, int64(1), retryRes.Count)
 
-	var count int64
-	err = db.QueryRowContext(ctx, "SELECT count(*) FROM lake.results_job999").Scan(&count)
-	require.NoError(t, err)
-	require.Equal(t, int64(2), count)
+	// Verify slot self-healing after a failed query
+	_, err = eng.ExecuteJob(ctx, "job_bad", "orders_db", "SELECT * FROM non_existent_table")
+	require.Error(t, err)
 
-	var file string
-	var size int64
-	err = db.QueryRowContext(ctx, "SELECT data_file, data_file_size_bytes FROM ducklake_list_files('lake', 'results_job999')").Scan(&file, &size)
+	// Verify subsequent jobs on healed slot still succeed
+	emptyRes, err := eng.ExecuteJob(ctx, "job_empty", "orders_db", "SELECT * FROM entries WHERE user_id = ?", "NON_EXISTENT")
 	require.NoError(t, err)
-	require.NotEmpty(t, file)
-	t.Logf("Engine execution verified! Results: %d rows, File: %s (%d bytes)", count, file, size)
-	db.Close()
+	require.Equal(t, int64(0), emptyRes.Count)
+}
+
+func TestServerOnlyGuard(t *testing.T) {
+	cfg := Config{
+		ServerOnly: true,
+		DuckLake: DuckLakeConfig{
+			Catalog:  "ducklake:test.db",
+			DataPath: "/tmp/data/",
+		},
+		Sources: map[string]SourceConfig{
+			"db1": {Type: "postgres", DSN: "host=localhost"},
+		},
+	}
+	eng, err := New(cfg, nil)
+	require.NoError(t, err)
+	defer eng.Close()
+
+	_, err = eng.ExecuteJob(context.Background(), "job1", "db1", "SELECT 1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "server-only mode")
 }
 
 func TestDuckLakeS3ConfigValidation(t *testing.T) {
@@ -133,7 +150,6 @@ func TestDuckLakeS3ConfigValidation(t *testing.T) {
 		DuckLake: DuckLakeConfig{
 			Catalog:  "ducklake:test.db",
 			DataPath: "s3://my-bucket/data/",
-			// S3Region and S3Endpoint omitted
 		},
 		Sources: map[string]SourceConfig{
 			"db1": {Type: "postgres", DSN: "host=localhost"},

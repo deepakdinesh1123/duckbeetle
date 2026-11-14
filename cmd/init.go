@@ -43,6 +43,7 @@ func initFlags(ko *koanf.Koanf) {
 	f.String("worker-name", "default", "name of this worker instance")
 	f.Int("worker-concurrency", 10, "number of concurrent worker threads to run")
 	f.Bool("worker-only", false, "don't start the web server and run in worker-only mode")
+	f.Bool("server-only", false, "don't start background workers and run in server-only mode")
 	f.Bool("version", false, "show current version and build")
 	f.Parse(os.Args[1:])
 
@@ -191,6 +192,8 @@ func initCore(ko *koanf.Koanf) (*core.Core, error) {
 	}
 
 	engCfg := engine.Config{
+		PoolSize:          ko.Int("worker-concurrency"),
+		ServerOnly:        ko.Bool("server-only"),
 		ThreadsPerJob:     threads,
 		MemoryLimitPerJob: memLimit,
 		DuckLake:          lakeCfg,
