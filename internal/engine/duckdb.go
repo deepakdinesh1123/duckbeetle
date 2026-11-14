@@ -74,8 +74,22 @@ func (cfg *Config) Validate() error {
 		return fmt.Errorf("ducklake.data_path is required")
 	}
 	if strings.HasPrefix(cfg.DuckLake.DataPath, "s3://") {
-		if cfg.DuckLake.S3Region == "" && cfg.DuckLake.S3Endpoint == "" {
-			return fmt.Errorf("ducklake.data_path is an S3 URI ('%s') but neither ducklake.s3_region nor ducklake.s3_endpoint is configured", cfg.DuckLake.DataPath)
+		if cfg.DuckLake.S3Region == "" {
+			return fmt.Errorf("ducklake.s3_region is required when using S3 data path ('%s')", cfg.DuckLake.DataPath)
+		}
+		if cfg.DuckLake.S3Endpoint == "" {
+			return fmt.Errorf("ducklake.s3_endpoint is required when using S3 data path ('%s')", cfg.DuckLake.DataPath)
+		}
+		if (cfg.DuckLake.S3AccessKey != "" && cfg.DuckLake.S3SecretKey == "") ||
+			(cfg.DuckLake.S3AccessKey == "" && cfg.DuckLake.S3SecretKey != "") {
+			return fmt.Errorf("both ducklake.s3_access_key and ducklake.s3_secret_key must be configured together")
+		}
+		if cfg.DuckLake.S3URLStyle == "" {
+			if !cfg.DuckLake.S3UseSSL || strings.Contains(cfg.DuckLake.S3Endpoint, "127.0.0.1") || strings.Contains(cfg.DuckLake.S3Endpoint, "localhost") {
+				cfg.DuckLake.S3URLStyle = "path"
+			} else {
+				cfg.DuckLake.S3URLStyle = "vhost"
+			}
 		}
 	}
 	return nil
@@ -172,28 +186,29 @@ func (e *DuckDBEngine) createInitializedSlotDB(ctx context.Context) (*sql.DB, er
 		return nil, fmt.Errorf("failed to set memory limit: %w", err)
 	}
 
-	// 2. Configure S3 Secret
-	if e.cfg.DuckLake.S3Region != "" || e.cfg.DuckLake.S3Endpoint != "" {
-		secretSQL := "CREATE SECRET s3_creds (TYPE S3"
-		if e.cfg.DuckLake.S3Region != "" {
-			secretSQL += fmt.Sprintf(", REGION '%s'", escapeSQLString(e.cfg.DuckLake.S3Region))
+	// 2. Configure S3 Secret (only if using S3)
+	if strings.HasPrefix(e.cfg.DuckLake.DataPath, "s3://") {
+		authClause := "PROVIDER CREDENTIAL_CHAIN"
+		if e.cfg.DuckLake.S3AccessKey != "" {
+			authClause = fmt.Sprintf("KEY_ID '%s', SECRET '%s'",
+				escapeSQLString(e.cfg.DuckLake.S3AccessKey),
+				escapeSQLString(e.cfg.DuckLake.S3SecretKey),
+			)
 		}
-		if e.cfg.DuckLake.S3Endpoint != "" {
-			secretSQL += fmt.Sprintf(", ENDPOINT '%s'", escapeSQLString(e.cfg.DuckLake.S3Endpoint))
-		}
-		if e.cfg.DuckLake.S3AccessKey != "" && e.cfg.DuckLake.S3SecretKey != "" {
-			secretSQL += fmt.Sprintf(", KEY_ID '%s', SECRET '%s'", escapeSQLString(e.cfg.DuckLake.S3AccessKey), escapeSQLString(e.cfg.DuckLake.S3SecretKey))
-		} else {
-			secretSQL += ", PROVIDER CREDENTIAL_CHAIN"
-		}
-		urlStyle := e.cfg.DuckLake.S3URLStyle
-		if urlStyle == "" && (!e.cfg.DuckLake.S3UseSSL || strings.Contains(e.cfg.DuckLake.S3Endpoint, "127.0.0.1") || strings.Contains(e.cfg.DuckLake.S3Endpoint, "localhost")) {
-			urlStyle = "path"
-		}
-		if urlStyle != "" {
-			secretSQL += fmt.Sprintf(", URL_STYLE '%s'", escapeSQLString(urlStyle))
-		}
-		secretSQL += fmt.Sprintf(", USE_SSL %t);", e.cfg.DuckLake.S3UseSSL)
+		secretSQL := fmt.Sprintf(`CREATE SECRET s3_creds (
+			TYPE S3,
+			REGION '%s',
+			ENDPOINT '%s',
+			URL_STYLE '%s',
+			USE_SSL %t,
+			%s
+		);`,
+			escapeSQLString(e.cfg.DuckLake.S3Region),
+			escapeSQLString(e.cfg.DuckLake.S3Endpoint),
+			escapeSQLString(e.cfg.DuckLake.S3URLStyle),
+			e.cfg.DuckLake.S3UseSSL,
+			authClause,
+		)
 		if _, err := db.ExecContext(ctx, secretSQL); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to configure s3 secret: %w", err)

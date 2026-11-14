@@ -157,5 +157,16 @@ func TestDuckLakeS3ConfigValidation(t *testing.T) {
 	}
 	_, err := New(cfg, nil)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "neither ducklake.s3_region nor ducklake.s3_endpoint is configured")
+	require.Contains(t, err.Error(), "ducklake.s3_region is required")
+
+	cfg.DuckLake.S3Region = "us-east-1"
+	_, err = New(cfg, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "ducklake.s3_endpoint is required")
+
+	cfg.DuckLake.S3Endpoint = "minio:9000"
+	cfg.DuckLake.S3AccessKey = "key_only"
+	_, err = New(cfg, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "must be configured together")
 }
