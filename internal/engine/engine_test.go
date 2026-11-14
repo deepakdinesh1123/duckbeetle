@@ -95,7 +95,8 @@ func TestDuckDBEngineExecuteJob(t *testing.T) {
 		},
 	}
 
-	eng := New(cfg, nil)
+	eng, err := New(cfg, nil)
+	require.NoError(t, err)
 	require.Equal(t, "ducklake:"+catalogFile, eng.GetCatalog())
 
 	// Execute job
@@ -125,4 +126,20 @@ func TestDuckDBEngineExecuteJob(t *testing.T) {
 	require.NotEmpty(t, file)
 	t.Logf("Engine execution verified! Results: %d rows, File: %s (%d bytes)", count, file, size)
 	db.Close()
+}
+
+func TestDuckLakeS3ConfigValidation(t *testing.T) {
+	cfg := Config{
+		DuckLake: DuckLakeConfig{
+			Catalog:  "ducklake:test.db",
+			DataPath: "s3://my-bucket/data/",
+			// S3Region and S3Endpoint omitted
+		},
+		Sources: map[string]SourceConfig{
+			"db1": {Type: "postgres", DSN: "host=localhost"},
+		},
+	}
+	_, err := New(cfg, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "neither ducklake.s3_region nor ducklake.s3_endpoint is configured")
 }

@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"math/rand"
 	"regexp"
-	"strconv"
 	"sync"
 	"time"
 
@@ -196,10 +195,7 @@ func (co *Core) GetJobStatus(jobID string) (models.JobStatusResp, error) {
 	var payload models.JobResultPayload
 	if len(res) > 0 {
 		if err := json.Unmarshal(res, &payload); err != nil {
-			// legacy fallback if plain row count int was stored
-			if count, err := strconv.ParseInt(string(res), 10, 64); err == nil {
-				payload.Count = count
-			}
+			co.lo.Error("error unmarshaling job result payload", "error", err, "job_id", jobID)
 		}
 	}
 
@@ -334,6 +330,10 @@ func (co *Core) makeJob(j models.JobReq, taskName string) (tasqueue.Job, error) 
 	task, ok := co.tasks[taskName]
 	if !ok {
 		return tasqueue.Job{}, fmt.Errorf("unrecognized task: %s", taskName)
+	}
+
+	if j.DB != "" && !task.HasDB(j.DB) {
+		return tasqueue.Job{}, fmt.Errorf("unrecognized source DB '%s' for task '%s'", j.DB, taskName)
 	}
 
 	msg, err := co.q.GetJob(context.Background(), j.JobID)
@@ -495,18 +495,14 @@ func (co *Core) execJob(jobID, taskName, dbName string, args []interface{}, task
 	}
 
 	// Determine source database:
-	// 1. Explicit DB in request
-	// 2. Tagged DB in task (random if multiple)
-	// 3. Fallback to any configured source
+	// 1. Explicit DB in request (validated in makeJob)
+	// 2. Random DB from task.DBs (read replica load balancing)
 	sourceDB := dbName
 	if sourceDB == "" && len(task.DBs) > 0 {
 		sourceDB = task.DBs[rand.Intn(len(task.DBs))]
 	}
 	if sourceDB == "" {
-		for s := range co.engine.GetSources() {
-			sourceDB = s
-			break
-		}
+		return models.JobResultPayload{}, fmt.Errorf("no source database available for task '%s'", taskName)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

@@ -48,9 +48,34 @@ type DuckDBEngine struct {
 	lo  *slog.Logger
 }
 
-// New creates a new DuckDBEngine instance.
-func New(cfg Config, lo *slog.Logger) *DuckDBEngine {
-	return &DuckDBEngine{cfg: cfg, lo: lo}
+// Validate checks engine configuration at startup and fails fast if required parameters are missing.
+func (cfg *Config) Validate() error {
+	if cfg.DuckLake.Catalog == "" {
+		return fmt.Errorf("ducklake.catalog is required")
+	}
+	if cfg.DuckLake.DataPath == "" {
+		return fmt.Errorf("ducklake.data_path is required")
+	}
+	if strings.HasPrefix(cfg.DuckLake.DataPath, "s3://") {
+		if cfg.DuckLake.S3Region == "" && cfg.DuckLake.S3Endpoint == "" {
+			return fmt.Errorf("ducklake.data_path is an S3 URI ('%s') but neither ducklake.s3_region nor ducklake.s3_endpoint is configured", cfg.DuckLake.DataPath)
+		}
+	}
+	return nil
+}
+
+// New creates a new DuckDBEngine instance with safe defaults and validates configuration.
+func New(cfg Config, lo *slog.Logger) (*DuckDBEngine, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if cfg.ThreadsPerJob <= 0 {
+		cfg.ThreadsPerJob = 2
+	}
+	if cfg.MemoryLimitPerJob == "" {
+		cfg.MemoryLimitPerJob = "2GB"
+	}
+	return &DuckDBEngine{cfg: cfg, lo: lo}, nil
 }
 
 // GetCatalog returns the DuckLake catalog connection string.
@@ -77,16 +102,21 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 	}
 	defer db.Close()
 
-	// 2. Resource limits
-	if e.cfg.ThreadsPerJob > 0 {
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA threads=%d;", e.cfg.ThreadsPerJob)); err != nil {
-			return models.JobResultPayload{}, err
-		}
+	// 2. Resource limits (safe fallback defaults if omitted from config)
+	threads := e.cfg.ThreadsPerJob
+	if threads <= 0 {
+		threads = 2
 	}
-	if e.cfg.MemoryLimitPerJob != "" {
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA memory_limit='%s';", e.cfg.MemoryLimitPerJob)); err != nil {
-			return models.JobResultPayload{}, err
-		}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA threads=%d;", threads)); err != nil {
+		return models.JobResultPayload{}, fmt.Errorf("failed to set thread limit: %w", err)
+	}
+
+	memLimit := e.cfg.MemoryLimitPerJob
+	if memLimit == "" {
+		memLimit = "2GB"
+	}
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("PRAGMA memory_limit='%s';", memLimit)); err != nil {
+		return models.JobResultPayload{}, fmt.Errorf("failed to set memory limit: %w", err)
 	}
 
 	// 3. Configure S3 Secret if region/endpoint provided
@@ -122,12 +152,14 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 		return models.JobResultPayload{}, fmt.Errorf("failed to attach ducklake: %w", err)
 	}
 
-	// 5. Attach Source DB if specified
-	if sourceDB != "" {
-		src, ok := e.cfg.Sources[sourceDB]
-		if !ok {
-			return models.JobResultPayload{}, fmt.Errorf("unknown source db '%s'", sourceDB)
-		}
+	// 5. Attach Source DB
+	if sourceDB == "" {
+		return models.JobResultPayload{}, fmt.Errorf("source database must be specified")
+	}
+	src, ok := e.cfg.Sources[sourceDB]
+	if !ok {
+		return models.JobResultPayload{}, fmt.Errorf("unknown source db '%s'", sourceDB)
+	}
 		var attachSrc string
 		switch strings.ToLower(src.Type) {
 		case "postgres":
@@ -154,10 +186,9 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 			return models.JobResultPayload{}, fmt.Errorf("failed to attach source '%s': %w", sourceDB, err)
 		}
 
-		// Switch active catalog context to sourceDB so unqualified table names resolve directly
-		if _, err := db.ExecContext(ctx, fmt.Sprintf("USE %s;", sourceDB)); err != nil {
-			return models.JobResultPayload{}, fmt.Errorf("failed to switch context to source '%s': %w", sourceDB, err)
-		}
+	// Switch active catalog context to sourceDB so unqualified table names resolve directly
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("USE %s;", sourceDB)); err != nil {
+		return models.JobResultPayload{}, fmt.Errorf("failed to switch context to source '%s': %w", sourceDB, err)
 	}
 
 	// 6. Execute CTAS directly into DuckLake

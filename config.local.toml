@@ -1,6 +1,6 @@
 [app]
 log_level = "INFO"
-default_job_ttl = "72h"
+default_job_ttl = "60s"
 
 [server]
 bind = "127.0.0.1:6060"

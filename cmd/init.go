@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	bredis "github.com/kalbhor/tasqueue/v2/brokers/redis"
@@ -179,14 +180,27 @@ func initCore(ko *koanf.Koanf) (*core.Core, error) {
 		return nil, fmt.Errorf("found 0 source databases in config under [sources]")
 	}
 
-	// 3. Initialize DuckDB Engine
+	// 3. Initialize DuckDB Engine (with safe fallbacks)
+	threads := ko.Int("duckdb.threads_per_job")
+	if threads <= 0 {
+		threads = 2
+	}
+	memLimit := ko.String("duckdb.memory_limit_per_job")
+	if memLimit == "" {
+		memLimit = "2GB"
+	}
+
 	engCfg := engine.Config{
-		ThreadsPerJob:     ko.Int("duckdb.threads_per_job"),
-		MemoryLimitPerJob: ko.String("duckdb.memory_limit_per_job"),
+		ThreadsPerJob:     threads,
+		MemoryLimitPerJob: memLimit,
 		DuckLake:          lakeCfg,
 		Sources:           sources,
 	}
-	eng := engine.New(engCfg, log)
+	eng, err := engine.New(engCfg, log)
+	if err != nil {
+		log.Error("failed to initialize duckdb engine", "error", err)
+		return nil, fmt.Errorf("failed to initialize duckdb engine: %w", err)
+	}
 
 	// 4. Broker / Results Queue (Redis via Tasqueue)
 	if v := ko.MustString("job_queue.broker.type"); v != "redis" {
@@ -220,11 +234,19 @@ func initCore(ko *koanf.Koanf) (*core.Core, error) {
 		MetaExpiry:   ko.Duration("job_queue.state.meta_expiry"),
 	}, lo)
 
-	// 5. Initialize Core
+	// 5. Initialize Core (with safe default_job_ttl fallback)
+	jobTTL := ko.Duration("app.default_job_ttl")
+	if jobTTL == 0 {
+		jobTTL = ko.Duration("default_job_ttl")
+	}
+	if jobTTL == 0 {
+		jobTTL = time.Minute
+	}
+
 	co := core.New(core.Opt{
 		DefaultQueue:            ko.MustString("queue"),
 		DefaultGroupConcurrency: ko.MustInt("worker-concurrency"),
-		DefaultJobTTL:           ko.MustDuration("app.default_job_ttl"),
+		DefaultJobTTL:           jobTTL,
 		Results:                 rResult,
 		Broker:                  rBroker,
 	}, eng, lo)
