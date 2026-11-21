@@ -1,17 +1,28 @@
-FROM golang:1.21-alpine AS builder
-RUN apk update && apk add make git
-WORKDIR /dungbeetle/
+FROM golang:1.26-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    make \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /duckbeetle/
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY ./ ./
-ENV CGO_ENABLED=0 GOOS=linux
+ENV CGO_ENABLED=1
 RUN make build
 
-FROM alpine:latest AS deploy
-RUN apk --no-cache add ca-certificates
-COPY --from=builder /dungbeetle/dungbeetle ./
-COPY --from=builder /dungbeetle/sql ./
+FROM debian:bookworm-slim AS deploy
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /duckbeetle/duckbeetle ./
+COPY --from=builder /duckbeetle/sql ./sql
 RUN mkdir -p /opt/config
-COPY --from=builder /dungbeetle/config.toml.sample /opt/config/dungbeetle.toml
 
 VOLUME ["/opt/config/"]
 
-CMD ["./dungbeetle", "--config", "/opt/config/dungbeetle.toml"]
+CMD ["./duckbeetle"]

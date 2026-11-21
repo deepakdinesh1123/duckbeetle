@@ -1,0 +1,53 @@
+[app]
+log_level = "INFO"
+default_job_ttl = "60s"
+
+[server]
+bind = "0.0.0.0:6060"
+
+[job_queue.broker]
+type = "redis"
+addresses = ["redis:6379"]
+password = ""
+db = 1
+max_active = 50
+max_idle = 20
+dial_timeout = "1s"
+read_timeout = "1s"
+write_timeout = "1s"
+
+[job_queue.state]
+type = "redis"
+addresses = ["redis:6379"]
+password = ""
+db = 1
+max_active = 50
+max_idle = 20
+dial_timeout = "1s"
+read_timeout = "1s"
+write_timeout = "1s"
+expiry = "86400s"
+meta_expiry = "86400s"
+
+[duckdb]
+threads_per_job = 2
+memory_limit_per_job = "2GB"
+
+[ducklake]
+catalog = "ducklake:postgres:dbname=ducklake_catalog host=postgres user=testUser password=testPass port=5432 sslmode=disable"
+data_path = "s3://reports-bucket/data/"
+
+s3_region = "us-east-1"
+s3_endpoint = "minio:9000"
+s3_access_key = "minioadmin"
+s3_secret_key = "minioadmin"
+s3_use_ssl = false
+s3_url_style = "path"
+
+[sources.pg_orders]
+type = "postgres"
+dsn = "dbname=testDB host=postgres user=testUser password=testPass port=5432 sslmode=disable"
+
+[sources.mysql_orders]
+type = "mysql"
+dsn = "host=mysql user=user password=userpassword port=3306 database=mydb"

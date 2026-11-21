@@ -1,3 +1,4 @@
 config_test.toml
 # binary file produced by `make build`.
 dungbeetle
+duckbeetle
