@@ -6,19 +6,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	gomysql "github.com/go-sql-driver/mysql"
-	_ "github.com/lib/pq"
 	"github.com/zerodha/dungbeetle/v2/models"
 )
 
 var reSafeIdentifier = regexp.MustCompile(`^[a-zA-Z0-9_:-]+$`)
-
-const duckLakeAdvisoryLockKey int64 = 84729104
 
 // escapeSQLString escapes single quotes in SQL string literals.
 func escapeSQLString(s string) string {
@@ -31,7 +29,7 @@ type SourceConfig struct {
 	DSN  string `koanf:"dsn"`
 }
 
-// DuckLakeConfig defines catalog and data storage parameters for DuckLake.
+// DuckLakeConfig defines data storage parameters for Parquet output.
 type DuckLakeConfig struct {
 	Catalog     string `koanf:"catalog"`
 	DataPath    string `koanf:"data_path"`
@@ -78,7 +76,7 @@ func (s *Slot) getOrConnect(ctx context.Context, e *DuckDBEngine) (*sql.DB, erro
 	return s.db, nil
 }
 
-// invalidate closes and resets the slot's DuckDB instance when a fatal connection or catalog error occurs.
+// invalidate closes and resets the slot's DuckDB instance when a fatal connection error occurs.
 func (s *Slot) invalidate() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,26 +98,20 @@ func (s *Slot) close() {
 	}
 }
 
-// DuckDBEngine manages executing jobs against source databases with DuckLake outputs.
-// It uses a Per-Slot Long-Lived DuckDB Instance pool combined with direct streaming `COPY ... TO` Parquet
-// and a PostgreSQL Advisory Lock around `ducklake_add_data_files` to achieve zero temp-table memory bloat
-// and zero snapshot concurrency collisions.
+// DuckDBEngine manages executing jobs against source databases and streaming Parquet outputs directly to S3/disk.
+// It uses a Per-Slot Long-Lived DuckDB Instance pool with direct streaming `COPY ... TO` Parquet,
+// requiring zero catalog databases, zero locks, and zero temp-table memory bloat.
 type DuckDBEngine struct {
-	cfg           Config
-	lo            *slog.Logger
-	slots         []*Slot
-	slotsMu       sync.Mutex
-	slotPool      chan *Slot
-	catalogLockDB *sql.DB
-	catalogMu     sync.Mutex
-	closed        bool
+	cfg      Config
+	lo       *slog.Logger
+	slots    []*Slot
+	slotsMu  sync.Mutex
+	slotPool chan *Slot
+	closed   bool
 }
 
 // Validate checks engine configuration at startup and fails fast if required parameters are missing.
 func (cfg *Config) Validate() error {
-	if cfg.DuckLake.Catalog == "" {
-		return fmt.Errorf("ducklake.catalog is required")
-	}
 	if cfg.DuckLake.DataPath == "" {
 		return fmt.Errorf("ducklake.data_path is required")
 	}
@@ -145,23 +137,8 @@ func (cfg *Config) Validate() error {
 	return nil
 }
 
-// extractPostgresCatalogDSN extracts a lib/pq compatible DSN if the DuckLake catalog is backed by PostgreSQL.
-func extractPostgresCatalogDSN(catalog string) string {
-	if strings.HasPrefix(catalog, "ducklake:postgres://") || strings.HasPrefix(catalog, "ducklake:postgresql://") {
-		return strings.TrimPrefix(catalog, "ducklake:")
-	}
-	if strings.HasPrefix(catalog, "ducklake:postgres:") {
-		dsn := strings.TrimPrefix(catalog, "ducklake:postgres:")
-		if !strings.Contains(dsn, "sslmode=") {
-			dsn += " sslmode=disable"
-		}
-		return strings.TrimSpace(dsn)
-	}
-	return ""
-}
-
 // New creates a new DuckDBEngine instance with safe defaults and validates configuration.
-// It initializes dedicated long-lived DuckDB slot instances and a PostgreSQL advisory lock connection pool.
+// It initializes dedicated long-lived DuckDB slot instances.
 func New(cfg Config, lo *slog.Logger) (*DuckDBEngine, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -189,17 +166,6 @@ func New(cfg Config, lo *slog.Logger) (*DuckDBEngine, error) {
 		return eng, nil
 	}
 
-	// Initialize PostgreSQL catalog advisory lock connection if backed by Postgres.
-	if pgDSN := extractPostgresCatalogDSN(cfg.DuckLake.Catalog); pgDSN != "" {
-		lockDB, err := sql.Open("postgres", pgDSN)
-		if err != nil {
-			return nil, fmt.Errorf("failed to open postgres catalog lock connection: %w", err)
-		}
-		lockDB.SetMaxOpenConns(2)
-		lockDB.SetMaxIdleConns(2)
-		eng.catalogLockDB = lockDB
-	}
-
 	eng.slots = make([]*Slot, 0, cfg.PoolSize)
 	eng.slotPool = make(chan *Slot, cfg.PoolSize)
 	ctx := context.Background()
@@ -214,7 +180,7 @@ func New(cfg Config, lo *slog.Logger) (*DuckDBEngine, error) {
 		eng.slotPool <- slot
 	}
 
-	lo.Info("initialized dedicated duckdb worker slots", "slots", cfg.PoolSize, "threads_per_slot", cfg.ThreadsPerJob, "memory_per_slot", cfg.MemoryLimitPerJob)
+	lo.Info("initialized dedicated duckdb worker slots (catalog-free S3 streaming)", "slots", cfg.PoolSize, "threads_per_slot", cfg.ThreadsPerJob, "memory_per_slot", cfg.MemoryLimitPerJob)
 	return eng, nil
 }
 
@@ -265,36 +231,13 @@ func (e *DuckDBEngine) createInitializedSlotDB(ctx context.Context) (*sql.DB, er
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to configure s3 secret: %w", err)
 		}
-		// Cache HTTP HEAD / Parquet footer metadata in memory so read_parquet and ducklake_add_data_files
-		// do not make duplicate S3 network round-trips for the same file.
 		if _, err := db.ExecContext(ctx, "SET enable_http_metadata_cache = true;"); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to enable http metadata cache: %w", err)
 		}
 	}
 
-	// 3. Attach DuckLake under catalog lock so concurrent containers do not race when bootstrapping a fresh catalog DB.
-	attachErr := func() error {
-		unlock, err := e.acquireCatalogLock(ctx)
-		if err != nil {
-			return err
-		}
-		defer unlock()
-
-		attachLake := fmt.Sprintf(
-			"ATTACH '%s' AS lake (DATA_PATH '%s', DATA_INLINING_ROW_LIMIT 0);",
-			escapeSQLString(e.cfg.DuckLake.Catalog),
-			escapeSQLString(e.cfg.DuckLake.DataPath),
-		)
-		_, err = db.ExecContext(ctx, attachLake)
-		return err
-	}()
-	if attachErr != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("failed to attach ducklake: %w", attachErr)
-	}
-
-	// 4. Attach all configured sources ahead of time and eagerly prime schema metadata
+	// 3. Attach all configured sources ahead of time and eagerly prime schema metadata
 	for name, src := range e.cfg.Sources {
 		var attachSrc string
 		switch strings.ToLower(src.Type) {
@@ -333,34 +276,7 @@ func (e *DuckDBEngine) createInitializedSlotDB(ctx context.Context) (*sql.DB, er
 	return db, nil
 }
 
-// acquireCatalogLock acquires both the in-process mutex and the cross-container PostgreSQL transaction advisory lock.
-func (e *DuckDBEngine) acquireCatalogLock(ctx context.Context) (func(), error) {
-	e.catalogMu.Lock()
-	if e.catalogLockDB == nil {
-		return func() {
-			e.catalogMu.Unlock()
-		}, nil
-	}
-
-	tx, err := e.catalogLockDB.BeginTx(ctx, nil)
-	if err != nil {
-		e.catalogMu.Unlock()
-		return nil, fmt.Errorf("failed to begin catalog lock transaction: %w", err)
-	}
-
-	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", duckLakeAdvisoryLockKey); err != nil {
-		_ = tx.Rollback()
-		e.catalogMu.Unlock()
-		return nil, fmt.Errorf("failed to acquire postgres catalog advisory lock: %w", err)
-	}
-
-	return func() {
-		_ = tx.Commit()
-		e.catalogMu.Unlock()
-	}, nil
-}
-
-// Close gracefully closes all worker slot DuckDB instances and the catalog lock connection.
+// Close gracefully closes all worker slot DuckDB instances.
 func (e *DuckDBEngine) Close() {
 	e.slotsMu.Lock()
 	if e.closed {
@@ -389,13 +305,9 @@ func (e *DuckDBEngine) Close() {
 	}
 	e.slots = nil
 	e.slotsMu.Unlock()
-
-	if e.catalogLockDB != nil {
-		_ = e.catalogLockDB.Close()
-	}
 }
 
-// GetCatalog returns the DuckLake catalog connection string.
+// GetCatalog returns the configured catalog string (if any).
 func (e *DuckDBEngine) GetCatalog() string {
 	return e.cfg.DuckLake.Catalog
 }
@@ -405,11 +317,8 @@ func (e *DuckDBEngine) GetSources() map[string]SourceConfig {
 	return e.cfg.Sources
 }
 
-// ExecuteJob runs a query using Option C (Direct Streaming COPY TO S3 + Locked DuckLake Registration):
-// Phase 1 (Parallel, 100% Streaming, Zero TEMP TABLE): `COPY (<query>) TO 's3://.../results_<id>.parquet'`
-// streams directly from the source DB to Parquet storage without touching DuckLake or buffering in worker memory/disk.
-// Phase 2 (Cluster-Serialized via PostgreSQL Advisory Lock, ~3-5ms): Under `pg_advisory_xact_lock`,
-// creates the table schema in `lake` and registers the already-written Parquet file via `ducklake_add_data_files`.
+// ExecuteJob streams query results directly from the attached source DB to a Parquet file on S3/disk
+// (`COPY (<query>) TO 's3://.../results_<id>.parquet' (FORMAT PARQUET)`) with zero catalog overhead and zero locks.
 func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query string, args ...interface{}) (models.JobResultPayload, error) {
 	if e.cfg.ServerOnly || e.slotPool == nil {
 		return models.JobResultPayload{}, fmt.Errorf("cannot execute job: engine is running in server-only mode")
@@ -468,13 +377,12 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 	}
 
 	tableName := fmt.Sprintf("results_%s", jobID)
-	targetTable := fmt.Sprintf(`lake."%s"`, tableName)
 	dataRoot := strings.TrimRight(e.cfg.DuckLake.DataPath, "/")
 	parquetFile := fmt.Sprintf("%s/%s.parquet", dataRoot, tableName)
 	escapedParquetFile := escapeSQLString(parquetFile)
 	cleanedQuery := strings.TrimRight(strings.TrimSpace(query), ";")
 
-	// Phase 1: Stream directly from Source DB to Parquet file on S3/disk (Zero TEMP TABLE, Zero DuckLake lock)
+	// 2. Stream directly from Source DB to Parquet file on S3/disk (Zero TEMP TABLE, Zero Catalog Lock)
 	var count int64
 	copySQL := fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET)", cleanedQuery, escapedParquetFile)
 	if err := db.QueryRowContext(ctx, copySQL, args...).Scan(&count); err != nil {
@@ -484,59 +392,18 @@ func (e *DuckDBEngine) ExecuteJob(ctx context.Context, jobID, sourceDB, query st
 		return models.JobResultPayload{}, fmt.Errorf("query execution failed: %w", err)
 	}
 
-	// Phase 2: Cluster-Serialized DuckLake Catalog Registration (~3-5ms)
-	var files []string
 	var totalBytes int64
-
-	commitErr := func() error {
-		unlock, err := e.acquireCatalogLock(ctx)
-		if err != nil {
-			return err
+	if !strings.HasPrefix(parquetFile, "s3://") {
+		if fi, err := os.Stat(parquetFile); err == nil {
+			totalBytes = fi.Size()
 		}
-		defer unlock()
-
-		// Drop any prior table on retry, create empty table with schema inferred from the Parquet footer,
-		// and register the file in a single atomic DuckLake transaction.
-		registerSQL := fmt.Sprintf(
-			"BEGIN TRANSACTION; DROP TABLE IF EXISTS %s; CREATE TABLE %s AS SELECT * FROM read_parquet('%s') WITH NO DATA; CALL ducklake_add_data_files('lake', '%s', '%s'); COMMIT;",
-			targetTable, targetTable, escapedParquetFile, escapeSQLString(tableName), escapedParquetFile,
-		)
-		if _, err := db.ExecContext(ctx, registerSQL); err != nil {
-			if _, rbErr := db.ExecContext(context.Background(), "ROLLBACK;"); rbErr != nil {
-				slotHealthy = false
-			}
-			return fmt.Errorf("ducklake catalog registration failed: %w", err)
-		}
-
-		fileRows, err := db.QueryContext(ctx, fmt.Sprintf("SELECT data_file, data_file_size_bytes FROM ducklake_list_files('lake', '%s')", escapeSQLString(tableName)))
-		if err != nil {
-			return fmt.Errorf("failed to list ducklake files for '%s': %w", tableName, err)
-		}
-		defer fileRows.Close()
-
-		for fileRows.Next() {
-			var f string
-			var s int64
-			if err := fileRows.Scan(&f, &s); err != nil {
-				return fmt.Errorf("failed to scan ducklake file metadata: %w", err)
-			}
-			files = append(files, f)
-			totalBytes += s
-		}
-		if err := fileRows.Err(); err != nil {
-			return fmt.Errorf("error iterating ducklake file metadata: %w", err)
-		}
-		return nil
-	}()
-	if commitErr != nil {
-		return models.JobResultPayload{}, commitErr
 	}
 
 	return models.JobResultPayload{
 		Count:     count,
 		Table:     tableName,
 		Catalog:   e.cfg.DuckLake.Catalog,
-		Files:     files,
+		Files:     []string{parquetFile},
 		SizeBytes: totalBytes,
 	}, nil
 }

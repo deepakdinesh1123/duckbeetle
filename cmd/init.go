@@ -158,9 +158,9 @@ func initHTTP(h *Handlers, ko *koanf.Koanf) {
 }
 
 func initCore(ko *koanf.Koanf) (*core.Core, error) {
-	// 1. DuckLake Configuration
+	// 1. Storage / Parquet Output Configuration
 	lakeCfg := engine.DuckLakeConfig{
-		Catalog:     ko.MustString("ducklake.catalog"),
+		Catalog:     ko.String("ducklake.catalog"),
 		DataPath:    ko.MustString("ducklake.data_path"),
 		S3Region:    ko.String("ducklake.s3_region"),
 		S3Endpoint:  ko.String("ducklake.s3_endpoint"),
